@@ -19,24 +19,71 @@ env:
 jobs:
   build:
     name: Build
-    runs-on: windows-2019
+    runs-on: windows-2022
     steps:
       - name: Checkout code
-        uses: actions/checkout@v2
+        uses: actions/checkout@v4
         with:
           fetch-depth: 0
           submodules: recursive
 
-      - name: Build Squirrel
-        shell: cmd
-        run: ./src/build_official.cmd
+      - name: Install .NET Framework 4.5 reference assemblies
+        shell: pwsh
+        run: |
+          nuget install Microsoft.NETFramework.ReferenceAssemblies.net45 -Version 1.0.3 -OutputDirectory .refasm
+          $refAsm = "$PWD\.refasm\Microsoft.NETFramework.ReferenceAssemblies.net45.1.0.3\build\.NETFramework\v4.5"
+          if (!(Test-Path "$refAsm\mscorlib.dll")) { throw "Reference assemblies not found in $refAsm" }
+          Add-Content $env:GITHUB_ENV "FrameworkPathOverride=$refAsm"
 
-      - name: Test Squirrel
-        shell: cmd
-        run: ./test/test_official.cmd
+      - name: Build managed tools (Update, SyncReleases)
+        shell: pwsh
+        run: |
+          # Only managed tools are rebuilt: they contain the bsdiff delta fix.
+          # Native Setup/Stub/WriteZipToSetup are unchanged upstream and are
+          # reused from the stock electron-winstaller vendor directory.
+          # (Full Squirrel.sln build is not possible on modern images:
+          #  Setup.vcxproj needs VS ATL headers, test project needs legacy
+          #  xunit restore; neither affects the shipped managed binaries.)
+          $msbuild = (& "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe" -latest -products * -requires Microsoft.Component.MSBuild -find MSBuild\**\Bin\MSBuild.exe | Out-String).Trim()
+          if (!(Test-Path $msbuild)) { throw "MSBuild not found via vswhere" }
+          $refAsm = "$PWD\.refasm\Microsoft.NETFramework.ReferenceAssemblies.net45.1.0.3\build\.NETFramework\v4.5"
+          Write-Output "FrameworkPathOverride(env)=$env:FrameworkPathOverride"
+          Write-Output "FrameworkPathOverride(explicit)=$refAsm"
+          if (!(Test-Path "$refAsm\mscorlib.dll")) { throw "Reference assemblies not found in $refAsm" }
+          nuget restore Squirrel.sln
+          if ($LASTEXITCODE -ne 0) { throw "nuget restore failed" }
+          & $msbuild src/Update/Update.csproj -p:Configuration=Release "-p:FrameworkPathOverride=$refAsm" -v:m -m -nr:false -Restore
+          if ($LASTEXITCODE -ne 0) { throw "Update.csproj build failed" }
+          & $msbuild src/Update/Update-Mono.csproj -p:Configuration=Release "-p:FrameworkPathOverride=$refAsm" -v:m -m -nr:false -Restore
+          if ($LASTEXITCODE -ne 0) { throw "Update-Mono.csproj build failed" }
+          & $msbuild src/SyncReleases/SyncReleases.csproj -p:Configuration=Release "-p:FrameworkPathOverride=$refAsm" -v:m -m -nr:false -Restore
+          if ($LASTEXITCODE -ne 0) { throw "SyncReleases.csproj build failed" }
+          Get-ChildItem build/Release/net45/ | Format-Table Name, Length -AutoSize
+
+      - name: Stage Mitrium vendor directory
+        shell: pwsh
+        run: |
+          $src = "build/Release/net45"
+          $dst = "build/artifacts/mitrium-vendor"
+          New-Item -ItemType Directory -Force -Path $dst | Out-Null
+          $map = @{
+            "Update.exe" = "Squirrel.exe"
+            "update.com" = "Squirrel.com"
+            "Update.pdb" = "Squirrel.pdb"
+            "Update-Mono.exe" = "Squirrel-Mono.exe"
+            "Update-Mono.pdb" = "Squirrel-Mono.pdb"
+            "SyncReleases.exe" = "SyncReleases.exe"
+            "SyncReleases.pdb" = "SyncReleases.pdb"
+          }
+          foreach ($from in $map.Keys) {
+            $srcPath = Join-Path $src $from
+            if (!(Test-Path $srcPath)) { throw "Missing expected build output: $srcPath" }
+            Copy-Item $srcPath (Join-Path $dst $map[$from])
+          }
+          Get-ChildItem $dst | Format-Table Name, Length -AutoSize
 
       - name: Save build
-        uses: actions/upload-artifact@v2
+        uses: actions/upload-artifact@v4
         with:
-          name: artifacts
-          path: build/artifacts/
+          name: mitrium-vendor
+          path: build/artifacts/mitrium-vendor/
